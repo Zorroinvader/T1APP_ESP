@@ -1,216 +1,291 @@
-#include "BluetoothSerial.h" // For Bluetooth Classic SPP
+#include <Arduino.h>
+#include <BluetoothSerial.h>
+#include <ESP32Servo.h> // Good if your library uses this header name, or <Servo.h> if the ESP32Servo lib provides that
 
-// Check if Bluetooth components are enabled in ESP32 configuration
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth is not enabled! Please run `idf.py menuconfig` (for ESP-IDF) or check your board/SDK settings (for Arduino) to enable it.
+#error Bluetooth is not enabled! Please run `make menuconfig` to enable it
 #endif
 
-BluetoothSerial SerialBT; // Create an instance of the BluetoothSerial class
+BluetoothSerial SerialBT;
+String deviceName = "ESP32_RC_Bus";
 
-// --- Status LED Configuration (for Bluetooth connection status) ---
-#ifndef LED_BUILTIN
-  #define LED_BUILTIN 2 // Default to pin 2 if not defined by board package
-#endif
-const int statusLedPin = LED_BUILTIN;
-bool isClientConnected = false;
+// --- Pin Definitions ---
+const int motorEnablePin = 5;  // ENA for PWM
+const int motorPin1 = 18;      // IN1
+const int motorPin2 = 19;      // IN2
+const int servoPin = 13;
+const int headlightsPin = 23;
+const int backlightsPin = 22;
+const int blinkerLeftPin = 21;
+const int blinkerRightPin = 4;
+const int lichthupePin = 15;
 
-// --- Motor Control & Blinker Pin Definitions (Example Placeholder) ---
-// IMPORTANT: Replace these with actual pins if you connect LEDs/motors
-// const int MOTOR_PIN_FORWARD_LED = 13;
-// const int MOTOR_PIN_BACKWARD_LED = 12;
-// const int MOTOR_PIN_LEFT_LED = 14;
-// const int MOTOR_PIN_RIGHT_LED = 27;
-// const int MOTOR_PIN_STOP_LED = 26;
-const int BLINKER_LEFT_LED_PIN = 15;  // << EXAMPLE - Actual GPIO for Left Blinker LED
-const int BLINKER_RIGHT_LED_PIN = 16; // << EXAMPLE - Actual GPIO for Right Blinker LED
+// --- PWM Configuration (for motor) ---
+const int pwmChannel = 0;        // LEDC channel 0
+const int pwmFrequency = 1000;   // 1 kHz
+const int pwmResolution = 8;     // 8-bit resolution (0-255 duty cycle)
 
+// --- Servo Configuration ---
+Servo steeringServo; // If ESP32Servo provides Servo.h, this is fine. If it provides ESP32Servo.h, use that type if necessary.
+const int servoCenter = 90;
+const int servoLeft = 45;
+const int servoRight = 135;
+int currentSteerAngle = servoCenter;
 
-// --- Placeholder Motor Control Functions ---
-void allMotorsStop() {
-  Serial.println("SIM: All motors STOPPED.");
-  // --- Example LED Control (Uncomment and set pins if used) ---
-  // digitalWrite(MOTOR_PIN_FORWARD_LED, LOW);
-  // digitalWrite(MOTOR_PIN_BACKWARD_LED, LOW);
-  // digitalWrite(MOTOR_PIN_LEFT_LED, LOW);
-  // digitalWrite(MOTOR_PIN_RIGHT_LED, LOW);
-  // digitalWrite(MOTOR_PIN_STOP_LED, HIGH); // Turn ON stop indicator
+// --- Control State Variables ---
+bool motorMovingForward = false;
+bool motorMovingBackward = false;
+bool appGasErlaubt = true;
+bool sensorGasErlaubt = true; // Placeholder for actual sensor
+
+// Blinker States
+enum BlinkerState { OFF, LEFT_ON, RIGHT_ON };
+BlinkerState currentBlinkerState = OFF;
+unsigned long blinkerLastChange = 0;
+const long blinkInterval = 500; // ms
+bool blinkerPinState = false;
+
+// --- Helper Function for Feedback (to USB Serial Monitor) ---
+void printCommandFeedback(String command, String action) {
+  String feedback = "CMD: " + command + " -> Action: " + action;
+  Serial.println(feedback);
 }
 
-void moveForward() {
-  Serial.println("SIM: Moving FORWARD.");
-  allMotorsStop(); // Good practice
-  // --- Example LED Control ---
-  // digitalWrite(MOTOR_PIN_FORWARD_LED, HIGH);
-  // digitalWrite(MOTOR_PIN_STOP_LED, LOW);
+// --- Motor Control Functions ---
+void stoppeMotor() {
+  digitalWrite(motorPin1, LOW);
+  digitalWrite(motorPin2, LOW);
+  ledcWrite(pwmChannel, 0); // Set duty cycle to 0 for motor stop
+  motorMovingForward = false;
+  motorMovingBackward = false;
+  printCommandFeedback("Internal", "Motor Stopped");
 }
 
-void moveBackward() {
-  Serial.println("SIM: Moving BACKWARD.");
-  allMotorsStop();
-  // --- Example LED Control ---
-  // digitalWrite(MOTOR_PIN_BACKWARD_LED, HIGH);
-  // digitalWrite(MOTOR_PIN_STOP_LED, LOW);
-}
-
-void turnLeft() {
-  Serial.println("SIM: Turning LEFT.");
-  allMotorsStop();
-  // --- Example LED Control ---
-  // digitalWrite(MOTOR_PIN_LEFT_LED, HIGH);
-  // digitalWrite(MOTOR_PIN_STOP_LED, LOW);
-}
-
-void turnRight() {
-  Serial.println("SIM: Turning RIGHT.");
-  allMotorsStop();
-  // --- Example LED Control ---
-  // digitalWrite(MOTOR_PIN_RIGHT_LED, HIGH);
-  // digitalWrite(MOTOR_PIN_STOP_LED, LOW);
-}
-
-// --- NEW Blinker Control Functions ---
-void activateLeftBlinker() {
-  Serial.println("SIM: Blinker Left ACTIVATED (Command 'X').");
-  // --- Actual Physical Control (e.g., LED) ---
-  // digitalWrite(BLINKER_LEFT_LED_PIN, HIGH);
-  Serial.println("ESP32: Left Blinker Light ON"); // Terminal output
-  delay(3000); // Wait for 3 seconds
-  // digitalWrite(BLINKER_LEFT_LED_PIN, LOW);
-  Serial.println("ESP32: Left Blinker Light OFF"); // Terminal output
-  Serial.println("SIM: Blinker Left DEACTIVATED after 3s.");
-}
-
-void activateRightBlinker() {
-  Serial.println("SIM: Blinker Right ACTIVATED (Command 'Y').");
-  // --- Actual Physical Control (e.g., LED) ---
-  // digitalWrite(BLINKER_RIGHT_LED_PIN, HIGH);
-  Serial.println("ESP32: Right Blinker Light ON"); // Terminal output
-  delay(3000); // Wait for 3 seconds
-  // digitalWrite(BLINKER_RIGHT_LED_PIN, LOW);
-  Serial.println("ESP32: Right Blinker Light OFF"); // Terminal output
-  Serial.println("SIM: Blinker Right DEACTIVATED after 3s.");
-}
-
-
-// --- Bluetooth Event Callback Functions ---
-// (This is your existing reliable callback)
-void btClientConnectedCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
-  if (event == ESP_SPP_SRV_OPEN_EVT) { // Client connected
-    Serial.println(">>> Android Controller Connected! <<<");
-    isClientConnected = true;
-    digitalWrite(statusLedPin, HIGH); // Turn status LED ON solid
-    allMotorsStop(); // Ensure motors are stopped on new connection
-  } else if (event == ESP_SPP_CLOSE_EVT) { // Client disconnected
-    Serial.println(">>> Android Controller Disconnected. Waiting for new connection... <<<");
-    isClientConnected = false;
-    digitalWrite(statusLedPin, LOW); // Turn status LED OFF
-    allMotorsStop(); // Ensure motors are stopped when client disconnects
+void motorVorwaerts() {
+  if (appGasErlaubt && sensorGasErlaubt) {
+    digitalWrite(motorPin1, HIGH);
+    digitalWrite(motorPin2, LOW);
+    ledcWrite(pwmChannel, 200); // Set speed (0-255)
+    motorMovingForward = true;
+    motorMovingBackward = false;
+    printCommandFeedback("Internal", "Motor Forward");
+  } else {
+    stoppeMotor();
+    if (!appGasErlaubt) printCommandFeedback("Internal", "Motor Forward Blocked by App");
+    if (!sensorGasErlaubt) printCommandFeedback("Internal", "Motor Forward Blocked by Sensor");
   }
 }
 
-// --- Setup Function: Runs once when ESP32 boots or resets ---
+void motorRueckwaerts() {
+  if (appGasErlaubt) { // Sensor usually doesn't block reverse
+    digitalWrite(motorPin1, LOW);
+    digitalWrite(motorPin2, HIGH);
+    ledcWrite(pwmChannel, 150); // Set speed (0-255)
+    motorMovingForward = false;
+    motorMovingBackward = true;
+    printCommandFeedback("Internal", "Motor Backward");
+  } else {
+    stoppeMotor();
+    if (!appGasErlaubt) printCommandFeedback("Internal", "Motor Backward Blocked by App");
+  }
+}
+
+// --- Steering Control Functions ---
+void lenkeLinks() {
+  currentSteerAngle = servoLeft;
+  steeringServo.write(currentSteerAngle);
+  printCommandFeedback("L", "Steer Left");
+}
+
+void lenkeRechts() {
+  currentSteerAngle = servoRight;
+  steeringServo.write(currentSteerAngle);
+  printCommandFeedback("R", "Steer Right");
+}
+
+void zentriereLenkung() {
+  currentSteerAngle = servoCenter;
+  steeringServo.write(currentSteerAngle);
+  printCommandFeedback("C", "Steer Center");
+}
+
+// --- Light Control Functions ---
+void blinkerLinksEin() {
+  currentBlinkerState = LEFT_ON;
+  digitalWrite(blinkerRightPin, LOW); // Turn off other blinker
+  blinkerLastChange = millis();
+  blinkerPinState = true;
+  digitalWrite(blinkerLeftPin, blinkerPinState);
+  printCommandFeedback("1", "Blinker Left ON");
+}
+
+void blinkerLinksAus() {
+  if (currentBlinkerState == LEFT_ON) {
+    currentBlinkerState = OFF;
+    digitalWrite(blinkerLeftPin, LOW);
+    printCommandFeedback("2", "Blinker Left OFF");
+  }
+}
+
+void blinkerRechtsEin() {
+  currentBlinkerState = RIGHT_ON;
+  digitalWrite(blinkerLeftPin, LOW); // Turn off other blinker
+  blinkerLastChange = millis();
+  blinkerPinState = true;
+  digitalWrite(blinkerRightPin, blinkerPinState);
+  printCommandFeedback("3", "Blinker Right ON");
+}
+
+void blinkerRechtsAus() {
+  if (currentBlinkerState == RIGHT_ON) {
+    currentBlinkerState = OFF;
+    digitalWrite(blinkerRightPin, LOW);
+    printCommandFeedback("4", "Blinker Right OFF");
+  }
+}
+
+void scheinwerferEin() {
+  digitalWrite(headlightsPin, HIGH);
+  printCommandFeedback("5", "Headlights ON");
+}
+
+void scheinwerferAus() {
+  digitalWrite(headlightsPin, LOW);
+  printCommandFeedback("6", "Headlights OFF");
+}
+
+void ruecklichterEin() {
+  digitalWrite(backlightsPin, HIGH);
+  printCommandFeedback("7", "Backlights ON");
+}
+
+void ruecklichterAus() {
+  digitalWrite(backlightsPin, LOW);
+  printCommandFeedback("8", "Backlights OFF");
+}
+
+void lichthupe() {
+  digitalWrite(lichthupePin, HIGH);
+  printCommandFeedback("H", "Lichthupe (Flash ON)");
+  delay(300);
+  digitalWrite(lichthupePin, LOW);
+  printCommandFeedback("H", "Lichthupe (Flash OFF)");
+}
+
+void updateBlinkers() {
+  if (currentBlinkerState == OFF) {
+    return;
+  }
+  if (millis() - blinkerLastChange > blinkInterval) {
+    blinkerLastChange = millis();
+    blinkerPinState = !blinkerPinState;
+    if (currentBlinkerState == LEFT_ON) {
+      digitalWrite(blinkerLeftPin, blinkerPinState);
+    } else if (currentBlinkerState == RIGHT_ON) {
+      digitalWrite(blinkerRightPin, blinkerPinState);
+    }
+  }
+}
+
+
+// --- Setup ---
 void setup() {
-  // Initialize USB Serial for debugging
   Serial.begin(115200);
-  while (!Serial); // Wait for Serial port to connect
-  Serial.println("\n\n--- ESP32 Controller (Single Char Commands + Blinkers) ---");
+  SerialBT.begin(deviceName);
+  Serial.println("ESP32 RC Bus Ready. Waiting for Bluetooth commands...");
+  SerialBT.println("ESP32 RC Bus Ready."); // Shorter message for BT
 
-  // Initialize Status LED
-  pinMode(statusLedPin, OUTPUT);
-  digitalWrite(statusLedPin, LOW);
-  Serial.println("Status LED Initialized.");
+  // Configure Motor Pins
+  pinMode(motorPin1, OUTPUT);
+  pinMode(motorPin2, OUTPUT);
+  // Configure PWM for motorEnablePin (ENA)
+  pinMode(motorEnablePin, OUTPUT); // Set as output first
+  ledcSetup(pwmChannel, pwmFrequency, pwmResolution);
+  ledcAttachPin(motorEnablePin, pwmChannel);
+  stoppeMotor(); // Initialize motor in stopped state
 
-  // --- Initialize Motor/Blinker "Indicator" Pins (Example with LEDs) ---
-  Serial.println("Initializing Motor/Blinker Indicator LEDs (if enabled in code)...");
-  // pinMode(MOTOR_PIN_FORWARD_LED, OUTPUT); digitalWrite(MOTOR_PIN_FORWARD_LED, LOW);
-  // pinMode(MOTOR_PIN_BACKWARD_LED, OUTPUT); digitalWrite(MOTOR_PIN_BACKWARD_LED, LOW);
-  // pinMode(MOTOR_PIN_LEFT_LED, OUTPUT); digitalWrite(MOTOR_PIN_LEFT_LED, LOW);
-  // pinMode(MOTOR_PIN_RIGHT_LED, OUTPUT); digitalWrite(MOTOR_PIN_RIGHT_LED, LOW);
-  // pinMode(MOTOR_PIN_STOP_LED, OUTPUT); digitalWrite(MOTOR_PIN_STOP_LED, LOW);
-  pinMode(BLINKER_LEFT_LED_PIN, OUTPUT); digitalWrite(BLINKER_LEFT_LED_PIN, LOW);   // << NEW - For physical LED
-  pinMode(BLINKER_RIGHT_LED_PIN, OUTPUT); digitalWrite(BLINKER_RIGHT_LED_PIN, LOW); // << NEW - For physical LED
+  // Configure Servo
+  steeringServo.attach(servoPin); // Attach servo to pin
+  // steeringServo.setPeriodHertz(50); // Optional: Standard for analog servos if ESP32Servo lib supports it
+  zentriereLenkung(); // Center servo at start
 
-  // --- Initialize Bluetooth Serial ---
-  String deviceName = "ESP32_Ready"; // Your working device name
-  Serial.print("Initializing Bluetooth with device name: '");
-  Serial.print(deviceName);
-  Serial.println("'...");
+  // Configure Light Pins
+  pinMode(headlightsPin, OUTPUT);
+  pinMode(backlightsPin, OUTPUT);
+  pinMode(blinkerLeftPin, OUTPUT);
+  pinMode(blinkerRightPin, OUTPUT);
+  pinMode(lichthupePin, OUTPUT);
 
-  SerialBT.register_callback(btClientConnectedCallback); // Register unified callback
+  // Initialize lights to OFF
+  digitalWrite(headlightsPin, LOW);
+  digitalWrite(backlightsPin, LOW);
+  digitalWrite(blinkerLeftPin, LOW);
+  digitalWrite(blinkerRightPin, LOW);
+  digitalWrite(lichthupePin, LOW);
 
-  if (!SerialBT.begin(deviceName)) {
-    Serial.println("!!! CRITICAL ERROR: Bluetooth Serial begin() FAILED !!!");
-    while (true) { // Halt on critical error
-      digitalWrite(statusLedPin, HIGH); delay(100);
-      digitalWrite(statusLedPin, LOW);  delay(100);
-    }
-  } else {
-    Serial.println("*** Bluetooth Serial Initialized SUCCESSFULLY! ***");
-    Serial.println("*** Waiting for Android app to connect... ***");
-  }
-
-  uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_BT);
-  String macAddress = "";
-  for(int i=0; i<6; i++){
-    if(mac[i]<0x10) macAddress += "0";
-    macAddress += String(mac[i], HEX);
-    if(i<5) macAddress += ":";
-  }
-  macAddress.toUpperCase();
-  Serial.print("My Bluetooth MAC Address is: ");
-  Serial.println(macAddress);
-  Serial.println("-------------------------------------------------");
-  Serial.println("Send commands (F, B, L, R, S, X, Y) from the Android app."); // Updated help
-
-  allMotorsStop(); // Initial state: motors stopped
+  appGasErlaubt = true;
+  sensorGasErlaubt = true; // Default: sensor allows movement (no obstacle)
 }
 
-// --- Loop Function: Simple single-character processing ---
+// --- Main Loop ---
 void loop() {
-  if (isClientConnected) {
-    if (SerialBT.available()) {
-      char command = (char)SerialBT.read(); // Read the single incoming byte
+  if (SerialBT.available()) {
+    char cmd = SerialBT.read();
+    Serial.print("Received via BT: '"); Serial.print(cmd); Serial.println("'"); // Echo to USB Serial
 
-      Serial.print("Android App sent command: '");
-      Serial.print(command);
-      Serial.println("'");
+    switch (cmd) {
+      // Movement
+      case 'F': motorVorwaerts(); break;
+      case 'B': motorRueckwaerts(); break;
+      case 'S': stoppeMotor(); printCommandFeedback(String(cmd), "Command Stop Motor"); break; // Explicit feedback
+      case 'L': lenkeLinks(); break;
+      case 'R': lenkeRechts(); break;
+      case 'C': zentriereLenkung(); break;
 
-      switch (command) {
-        case 'F':
-          moveForward();
-          break;
-        case 'B':
-          moveBackward();
-          break;
-        case 'L':
-          turnLeft();
-          break;
-        case 'R':
-          turnRight();
-          break;
-        case 'S':
-          allMotorsStop();
-          break;
-        // --- NEW BLINKER COMMANDS ---
-        case 'X': // Command for Left Blinker
-          activateLeftBlinker();
-          break;
-        case 'Y': // Command for Right Blinker
-          activateRightBlinker();
-          break;
-        // --- END OF NEW BLINKER COMMANDS ---
-        default:
-          Serial.print("Unknown command: '");
-          Serial.print(command);
-          Serial.println("'. No action taken.");
-          break;
-      }
+      // Blinkers
+      case '1': blinkerLinksEin(); break;
+      case '2': blinkerLinksAus(); break;
+      case '3': blinkerRechtsEin(); break;
+      case '4': blinkerRechtsAus(); break;
+
+      // Other Lights
+      case '5': scheinwerferEin(); break;
+      case '6': scheinwerferAus(); break;
+      case '7': ruecklichterEin(); break;
+      case '8': ruecklichterAus(); break;
+      case 'H': lichthupe(); break;
+
+      // Auto-Stop Control (App Gas Erlaubt)
+      case 'A':
+        appGasErlaubt = true;
+        printCommandFeedback(String(cmd), "App Gas Allowed (Sensor Control Active)");
+        break;
+      case 'D':
+        appGasErlaubt = false;
+        stoppeMotor(); // Explicitly stop the motor
+        printCommandFeedback(String(cmd), "App Gas Disallowed (Force Stop by App)");
+        break;
+
+      default:
+        printCommandFeedback(String(cmd), "Unknown Command Received");
+        break;
     }
-  } else {
-    // Optional: "Waiting for connection" LED pattern for statusLedPin
-    // digitalWrite(statusLedPin, HIGH); delay(700);
-    // digitalWrite(statusLedPin, LOW);  delay(700);
   }
-  // Other non-blocking code can go here
+
+  updateBlinkers(); // Continuously update blinker state for flashing
+
+  // --- Auto-Stop Logic based on flags ---
+  // If motor was moving FORWARD and a state (app or sensor) changed to forbid movement
+  if ((!appGasErlaubt || !sensorGasErlaubt) && motorMovingForward) {
+      stoppeMotor(); // This will print its own "Motor Stopped" message
+      if(!appGasErlaubt) printCommandFeedback("StateCheck", "Motor stopped (App disallowed forward)");
+      if(!sensorGasErlaubt) printCommandFeedback("StateCheck", "Motor stopped (Sensor disallowed forward)");
+  }
+  // If motor was moving BACKWARD and app disallows it
+  if (!appGasErlaubt && motorMovingBackward) {
+      stoppeMotor(); // This will print its own "Motor Stopped" message
+      printCommandFeedback("StateCheck", "Motor stopped (App disallowed backward)");
+  }
+
+  delay(10); // Small delay to prevent loop from running too fast
 }
